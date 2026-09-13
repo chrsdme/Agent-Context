@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, datetime as dt, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time
+from pathlib import Path
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
+VERSION='1.2'
+MAX_CONTEXT=8000
+TURN_KEEP=3
+ARCHIVE_KEEP=5
+STATE_ENV='AGENT_CONTEXT_STATE_DIR'
+
+CONTINUITY='''<!-- AGENT-CONTEXT-CONTINUITY -->
+## Agent continuity
+
+This repository uses the shared `agent-context` recovery layer.
+
+- Treat the exact Git top-level as project identity; never infer identity from path ancestry.
+- Durable project handoff: `.ai/state/HANDOFF.md`.
+- Project context manifest: `.ai/project-context.toml`.
+- At a context/session boundary, prefer a durable handoff followed by a fresh session rather than rediscovering the repository.
+- If an exact predecessor is recovered, continue from that bounded state and follow its pointers only as needed.
+- If recovery reports that no exact predecessor was found, do NOT broadly search legacy handovers, session logs, Git history, or the repository merely to reconstruct the lost session. Report the recovery miss and use `agent-context recover --list` or ask for the intended workstream unless the user's prompt already supplies enough state.
+<!-- /AGENT-CONTEXT-CONTINUITY -->'''
+
+IDENTITY='''<!-- AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->
+## Repository Identity Guard
+
+Expected repository root:
+
+`{root}`
+
+Before modifying project files, verify the current Git top-level. If it does not exactly match the path above:
+
+- stop before writes;
+- do not compensate with absolute paths into another known repository;
+- report the actual and expected repository roots;
+- wait for an explicit redirect.
+
+This prevents cross-project workload mixing, including nested independent repositories.
+<!-- /AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->'''
+
+HANDOFF_TEMPLATE='''# Project Handoff
+
+Status: bootstrap placeholder
+
+This is the canonical durable handoff for this repository.
+Rolling per-turn recovery state is stored outside Git by `agent-context`.
+
+Use `/handoff` in Claude Code or `$handoff` in Codex to promote current session state here.
+'''
+
+CLAUDE_ADAPTER='''# Claude Code project adapter
+
+Use the canonical project rules in `AGENTS.md`.
+
+@AGENTS.md
+'''
+
+
+def now_iso(): return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec='seconds')
+def epoch(): return int(time.time())
+def state_root():
+    return Path(os.environ.get(STATE_ENV, str(Path.home()/'.local/state/agent-context'))).expanduser()
+def cap(s,n):
+    s='' if s is None else str(s)
+    return s if len(s)<=n else s[:max(0,n-32)]+f'\n[… {len(s)-n} chars omitted]'
+
+def _redact_kv(m): return f'{m.group(1)}=[REDACTED:CRED]'
+def _redact_header(m): return f'{m.group(1)}: [REDACTED:HEADER]'
+def _redact_url(m): return re.sub(r':[^:@]+@',':[REDACTED]@',m.group(0))
+REDACT_PATTERNS=[
+    (re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----',re.S),'[REDACTED:PEM]'),
+    (re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b'),'[REDACTED:JWT]'),
+    (re.compile(r'\bgh[pousr]_[A-Za-z0-9]{20,}\b'),'[REDACTED:GITHUB_TOKEN]'),
+    (re.compile(r'\bgithub_pat_[A-Za-z0-9_]{20,}\b'),'[REDACTED:GITHUB_TOKEN]'),
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'),'[REDACTED:AWS_KEY_ID]'),
+    (re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b'),'[REDACTED:SLACK_TOKEN]'),
+    (re.compile(r'(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}'),'Bearer [REDACTED:TOKEN]'),
+    (re.compile(r'(?i)\b(authorization|x-api-key|x-auth-token)\s*:\s*\S+'),_redact_header),
+    (re.compile(r'(?i)\b(set-cookie|cookie)\s*:\s*.+'),_redact_header),
+    (re.compile(r'(?i)\b([a-z0-9_]*(?:secret|token|passwd|password|pwd|api[_-]?key|access[_-]?key)[a-z0-9_]*)\s*[:=]\s*["\']?([^\s"\'`]{6,})["\']?'),_redact_kv),
+    (re.compile(r'[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:[^\s:/@]+@'),_redact_url),
+]
+def redact_text(s):
+    if not s: return s
+    for pat,repl in REDACT_PATTERNS:
+        s=pat.sub(repl,s)
+    return s
+def infer_ok(payload):
+    tr=payload.get('tool_response')
+    if isinstance(tr,dict):
+        if tr.get('is_error') is True: return False
+        if tr.get('is_error') is False: return True
+        return None
+    return None
+def redact_state(s):
+    if s.get('pending_prompt'): s['pending_prompt']=redact_text(s['pending_prompt'])
+    if s.get('last_error'): s['last_error']=redact_text(s['last_error'])
+    for t in s.get('turns',[]) or []:
+        if t.get('prompt'): t['prompt']=redact_text(t['prompt'])
+        if t.get('assistant'): t['assistant']=redact_text(t['assistant'])
+    for e in s.get('material_events',[]) or []:
+        if e.get('hint'): e['hint']=redact_text(e['hint'])
+    for key in ('git_initial','git_current'):
+        g=s.get(key)
+        if g and g.get('dirty'): g['dirty']=[redact_text(x) for x in g['dirty']]
+    return s
+def atomic_bytes(path:Path,data:bytes):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    old_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+    fd,tmp=tempfile.mkstemp(prefix=path.name+'.',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'wb') as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, old_mode)
+        os.replace(tmp,path)
+    finally:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+def atomic_text(path:Path,text:str): atomic_bytes(path,text.encode('utf-8'))
+def atomic_json(path,obj): atomic_text(path,json.dumps(obj,indent=2,sort_keys=True)+'\n')
+def read_json(path,default=None):
+    try: return json.loads(path.read_text(encoding='utf-8'))
+    except Exception: return {} if default is None else default
+def run(cmd,cwd=None,timeout=3):
+    try:
+        p=subprocess.run(cmd,cwd=cwd,text=True,capture_output=True,timeout=timeout)
+        return p.returncode,p.stdout.strip(),p.stderr.strip()
+    except Exception as e: return 127,'',str(e)
+def git_root(cwd):
+    if not cwd: return None
+    p=Path(cwd).expanduser()
+    if not p.exists(): return None
+    rc,out,_=run(['git','-C',str(p),'rev-parse','--show-toplevel'],timeout=2)
+    if rc==0 and out:
+        try: return Path(out).resolve()
+        except Exception: return Path(out)
+    return None
+def repo_id(root): return hashlib.sha256(str(root).encode()).hexdigest()[:20]
+def repo_dir(root): return state_root()/'repos'/repo_id(root)
+def lock_repo(root):
+    d=repo_dir(root); d.mkdir(parents=True,exist_ok=True)
+    f=open(d/'.lock','a+'); fcntl.flock(f,fcntl.LOCK_EX); return f
+
+def git_snapshot(root):
+    a,b,_=run(['git','-C',str(root),'branch','--show-current'],timeout=2)
+    c,h,_=run(['git','-C',str(root),'rev-parse','HEAD'],timeout=2)
+    d,s,_=run(['git','-C',str(root),'status','--short','--untracked-files=all'],timeout=3)
+    lines=s.splitlines() if d==0 and s else []
+    return {'branch':b if a==0 else '', 'head':h if c==0 else '', 'dirty_count':len(lines), 'dirty':lines[:20], 'dirty_truncated':max(0,len(lines)-20)}
+def dirty_fp(s): return hashlib.sha256(('\n'.join(s.get('dirty',[]))+f"#{s.get('dirty_count',0)}").encode()).hexdigest()
+
+def manifest_file(root): return root/'.ai/project-context.toml'
+def load_manifest(root):
+    data={}; p=manifest_file(root)
+    if p.exists() and tomllib:
+        try: data=tomllib.loads(p.read_text(encoding='utf-8'))
+        except Exception: data={}
+    fmt=str(data.get('handoff',{}).get('format','md') or 'md')
+    fmt=os.environ.get('AGENT_CONTEXT_FORMAT',fmt)
+    return {'project':data.get('project',root.name),'max_context_chars':int(data.get('max_context_chars',MAX_CONTEXT)), 'handoff':data.get('handoff',{}).get('path','.ai/state/HANDOFF.md'),'format':fmt if fmt in ('md','yaml') else 'md','pointers':data.get('pointers',{})}
+def default_format():
+    cfg=read_json(state_root()/'config.json',{})
+    fmt=cfg.get('default_format','md')
+    return fmt if fmt in ('md','yaml') else 'md'
+def manifest_text(project,pointers,fmt=None):
+    fmt=fmt if fmt in ('md','yaml') else default_format()
+    arr=lambda xs:'['+', '.join(json.dumps(str(x)) for x in xs)+']'
+    return '\n'.join(['version = 1',f'project = {json.dumps(project)}',f'max_context_chars = {MAX_CONTEXT}','','[handoff]','path = ".ai/state/HANDOFF.md"',f'format = "{fmt}"','','[pointers]',f"progress = {arr(pointers.get('progress',[]))}",f"knowledge = {arr(pointers.get('knowledge',[]))}",f"private_state = {arr(pointers.get('private_state',[]))}",f"legacy_handoffs = {arr(pointers.get('legacy_handoffs',[]))}",''])
+def detect_pointers(root):
+    prog=[]; know=[]; priv=[]; legacy=[]
+    for c in ['ROADMAP.md','roadmap.yaml','DESIGN.md','docs/obsidian/index.md','docs/obsidian/Current State.md']:
+        if (root/c).exists(): prog.append(c)
+    for c in ['HANDOVER.md','project_memory.md']:
+        if (root/c).exists(): legacy.append(c)
+    if (root/'docs/obsidian/index.md').exists(): know.append('docs/obsidian/index.md')
+    return {'progress':prog[:6],'knowledge':know[:4],'private_state':priv[:4],'legacy_handoffs':legacy[:4]}
+def _newline_for(raw:bytes):
+    return b'\r\n' if raw.count(b'\r\n') and raw.count(b'\r\n') >= max(1, raw.count(b'\n') // 2) else b'\n'
+def append_block_preserving(path:Path, block:str):
+    if not path.exists():
+        atomic_text(path, block.rstrip()+'\n'); return True
+    raw=path.read_bytes(); nl=_newline_for(raw); b=block.rstrip().replace('\r\n','\n').replace('\r','\n').replace('\n',nl.decode()).encode()
+    sep=b'' if raw.endswith((b'\n',b'\r')) else nl
+    atomic_bytes(path, raw+sep+nl+b+nl); return True
+def upsert_managed_block(path:Path, block:str, start_marker:str, end_marker:str):
+    if not path.exists():
+        atomic_text(path, block.rstrip()+'\n'); return 'created'
+    raw=path.read_bytes(); nl=_newline_for(raw)
+    start=start_marker.encode(); end=end_marker.encode()
+    a=raw.find(start); b=raw.find(end)
+    newb=block.rstrip().replace('\r\n','\n').replace('\r','\n').replace('\n',nl.decode()).encode()
+    if a>=0 and b>=a:
+        b += len(end)
+        atomic_bytes(path, raw[:a]+newb+raw[b:]); return 'updated'
+    append_block_preserving(path,block); return 'appended'
+def register(root,project):
+    p=state_root()/'registry.json'; reg=read_json(p,{'repos':{}}); reg.setdefault('repos',{})
+    reg['repos'][repo_id(root)]={'root':str(root),'project':project,'updated_at':now_iso()}; atomic_json(p,reg)
+
+def cmd_init(a):
+    root=git_root(a.repo or os.getcwd())
+    if not root: print('ERROR: not inside a Git repository',file=sys.stderr); return 2
+    project=a.project or root.name; (root/'.ai/state').mkdir(parents=True,exist_ok=True)
+    if not manifest_file(root).exists(): atomic_text(manifest_file(root),manifest_text(project,detect_pointers(root),fmt=a.format))
+    if not (root/'.ai/PROJECT.md').exists(): atomic_text(root/'.ai/PROJECT.md',f'# Agent Project Identity\n\n- Project: {project}\n- Repository root: `{root}`\n- Context manifest: `.ai/project-context.toml`\n- Durable handoff: `.ai/state/HANDOFF.md`\n- Rolling recovery: `~/.local/state/agent-context/`\n')
+    if not (root/'.ai/state/HANDOFF.md').exists(): atomic_text(root/'.ai/state/HANDOFF.md',HANDOFF_TEMPLATE)
+    agents=root/'AGENTS.md'
+    existing=agents.read_bytes() if agents.exists() else b''
+    if b'AGENT-CONTEXT-PROJECT-IDENTITY-GUARD' not in existing:
+        append_block_preserving(agents,IDENTITY.format(root=root))
+    elif b'AGENT-CONTEXT-PROJECT-IDENTITY-GUARD' in existing:
+        upsert_managed_block(agents,IDENTITY.format(root=root),'<!-- AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->','<!-- /AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->')
+    upsert_managed_block(agents,CONTINUITY,'<!-- AGENT-CONTEXT-CONTINUITY -->','<!-- /AGENT-CONTEXT-CONTINUITY -->')
+    if not (root/'CLAUDE.md').exists(): atomic_text(root/'CLAUDE.md',CLAUDE_ADAPTER)
+    register(root,project)
+    print(f'Initialized agent-context: {root}\nProject: {project}\nManifest: {manifest_file(root)}\nHandoff: {root/".ai/state/HANDOFF.md"}')
+    return 0
+
+def lineage_key(h):
+    vals=[f'{k}={os.environ[k]}' for k in ('TMUX_PANE','TERM_SESSION_ID','SSH_TTY') if os.environ.get(k)]
+    return hashlib.sha256((h+'|'+ '|'.join(vals)).encode()).hexdigest()[:20] if vals else None
+def save_lineage(h,root,sid):
+    lk=lineage_key(h)
+    if not lk: return
+    d=state_root()/'lineage'; d.mkdir(parents=True,exist_ok=True)
+    atomic_json(d/f'{h}-{lk}.json',{'harness':h,'repo_root':str(root),'session_id':sid,'updated_epoch':epoch(),'updated_at':now_iso()})
+def lineage_record(h,max_age=300):
+    lk=lineage_key(h)
+    if not lk: return None
+    o=read_json(state_root()/'lineage'/f'{h}-{lk}.json',{})
+    if o and epoch()-int(o.get('updated_epoch',0) or 0)<=max_age and o.get('repo_root'):
+        return o
+    return None
+def resolve_lineage(h,max_age=300):
+    o=lineage_record(h,max_age)
+    return Path(o['repo_root']) if o else None
+def save_transition(h,root,sid,reason):
+    d=state_root()/'transitions'; d.mkdir(parents=True,exist_ok=True)
+    o={'harness':h,'repo_root':str(root),'session_id':sid,'reason':reason,'created_epoch':epoch(),'created_at':now_iso(),'lineage_key':lineage_key(h)}
+    atomic_json(d/f"{epoch()}-{h}-{re.sub(r'[^A-Za-z0-9_.-]+','_',sid or 'unknown')}.json",o)
+def resolve_transition(h,max_age=120):
+    d=state_root()/'transitions'; lk=lineage_key(h); cand=[]
+    if not d.exists(): return None,[]
+    for p in d.glob('*.json'):
+        o=read_json(p,{}); age=epoch()-int(o.get('created_epoch',0) or 0)
+        if o.get('harness')!=h or age<0 or age>max_age: continue
+        if lk and o.get('lineage_key') and o.get('lineage_key')!=lk: continue
+        if o.get('repo_root'): cand.append(o)
+    roots=sorted(set(o['repo_root'] for o in cand))
+    return (Path(roots[0]),cand) if len(roots)==1 else (None,cand)
+
+def skey(h,sid): return f"{h}-{re.sub(r'[^A-Za-z0-9_.-]+','_',sid or 'unknown')}"
+def active_dir(root,h,sid): return repo_dir(root)/'active'/skey(h,sid)
+def spath(root,h,sid): return active_dir(root,h,sid)/'state.json'
+def ensure_session(root,payload,h):
+    sid=str(payload.get('session_id') or os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_SESSION_ID') or 'unknown')
+    p=spath(root,h,sid); snap=git_snapshot(root)
+    if p.exists(): s=read_json(p,{})
+    else:
+        m=load_manifest(root); s={'version':1,'project':m['project'],'repo_root':str(root),'harness':h,'session_id':sid,'transcript_path':payload.get('transcript_path'),'started_at':now_iso(),'started_epoch':epoch(),'updated_at':now_iso(),'updated_epoch':epoch(),'source':payload.get('source'),'turn_count':0,'pending_prompt':None,'turns':[],'material_events':[],'status':'active','git_initial':snap,'git_current':snap,'handoff_promoted':False,'last_error':None}
+    s['transcript_path']=payload.get('transcript_path') or s.get('transcript_path'); s['cwd']=payload.get('cwd') or s.get('cwd')
+    save_state(p,s); return s,p
+def save_state(p,s): s['updated_at']=now_iso(); s['updated_epoch']=epoch(); redact_state(s); atomic_json(p,s)
+
+def journal_path(d): return d/'journal.json'
+def journal_begin(d,op,steps):
+    d.mkdir(parents=True,exist_ok=True)
+    atomic_json(journal_path(d),{'op':op,'steps':steps,'done':[],'started_epoch':epoch(),'started_at':now_iso()})
+def journal_step(d,step):
+    p=journal_path(d); j=read_json(p,None)
+    if j is None: return
+    if step not in j.get('done',[]): j.setdefault('done',[]).append(step)
+    atomic_json(p,j)
+def journal_clear(d):
+    p=journal_path(d)
+    if p.exists():
+        try: p.unlink()
+        except FileNotFoundError: pass
+def journal_pending(d):
+    j=read_json(journal_path(d),None)
+    if not j: return None
+    remaining=[st for st in j.get('steps',[]) if st not in j.get('done',[])]
+    return j if remaining else None
+def scan_stale_journals(root,max_age=120):
+    out=[]
+    base=repo_dir(root)
+    for sub in ('active','archive'):
+        d=base/sub
+        if not d.exists(): continue
+        for x in d.iterdir():
+            if not x.is_dir(): continue
+            j=journal_pending(x)
+            if j and epoch()-int(j.get('started_epoch',0) or 0)>max_age:
+                out.append((x,j))
+    return out
+def resume_or_rollback_journal(dirpath,j):
+    op=j.get('op'); steps=j.get('steps',[]); done=set(j.get('done',[]))
+    if op=='archive':
+        state_file=dirpath/'state.json'
+        if not state_file.exists():
+            journal_clear(dirpath); return 'rolled-back:no-state'
+        s=read_json(state_file,{})
+        fmt=load_manifest(Path(s['repo_root']))['format'] if s.get('repo_root') else 'md'
+        if 'handoff_write' not in done:
+            atomic_text(dirpath/'handoff.md',handoff_text(s,fmt=fmt)); journal_step(dirpath,'handoff_write')
+        if 'archive_move' not in done and dirpath.parent.name=='active':
+            ar=dirpath.parent.parent/'archive'; ar.mkdir(parents=True,exist_ok=True)
+            dest=ar/f"{epoch()}-{skey(s.get('harness','unknown'),s.get('session_id','unknown'))}"
+            if dest.exists(): shutil.rmtree(dest)
+            shutil.move(str(dirpath),str(dest)); journal_step(dest,'archive_move')
+            dirpath=dest
+        if 'archive_trim' not in done and dirpath.parent.name=='archive':
+            ar=dirpath.parent
+            ds=sorted([x for x in ar.iterdir() if x.is_dir()],key=lambda x:x.stat().st_mtime,reverse=True)
+            for x in ds[ARCHIVE_KEEP:]: shutil.rmtree(x,ignore_errors=True)
+            journal_step(dirpath,'archive_trim')
+        journal_clear(dirpath); return 'resumed'
+    if op=='handoff':
+        state_file=dirpath/'state.json'
+        if not state_file.exists():
+            journal_clear(dirpath); return 'rolled-back:no-state'
+        s=read_json(state_file,{})
+        local_handoff=dirpath/'handoff.md'
+        if 'session_write' not in done and local_handoff.exists(): journal_step(dirpath,'session_write')
+        if 'canonical_promote' not in done and s.get('handoff_promoted') and s.get('repo_root'):
+            canonical=Path(s['repo_root'])/load_manifest(Path(s['repo_root']))['handoff']
+            if local_handoff.exists(): atomic_text(canonical,local_handoff.read_text(encoding='utf-8'))
+            journal_step(dirpath,'canonical_promote')
+        journal_clear(dirpath); return 'resumed'
+    journal_clear(dirpath); return 'rolled-back:unknown-op'
+def heal_stale_journals(root):
+    healed=[]
+    for d,j in scan_stale_journals(root):
+        outcome=resume_or_rollback_journal(d,j); healed.append((str(d),j.get('op'),outcome))
+    return healed
+def material_score(s):
+    turns=s.get('turns',[]); score=min(2,len(turns))
+    if sum(len(t.get('prompt',''))+len(t.get('assistant','')) for t in turns)>1000: score+=1
+    gi=s.get('git_initial',{}); gc=s.get('git_current',{})
+    if gi.get('head') and gc.get('head') and gi.get('head')!=gc.get('head'): score+=2
+    if dirty_fp(gi)!=dirty_fp(gc): score+=2
+    if s.get('handoff_promoted'): score+=2
+    if s.get('status') in ('failed','interrupted','precompact'): score+=1
+    return score
+
+def dedupe(xs):
+    out=[]
+    for x in xs:
+        if x not in out: out.append(x)
+    return out[:12]
+
+TEST_CMD_RE=re.compile(r'\b(pytest|go test|npm test|yarn test|pnpm test|jest|make test|cargo test|mvn test|gradle test|dotnet test|rspec|phpunit|ctest)\b',re.I)
+CLAIM_PATTERNS=[
+    ('tests_pass',re.compile(r'\btests?\s+(?:all\s+|now\s+)?pass(?:ed|ing)?\b',re.I)),
+    ('committed',re.compile(r'\b(committed|created a commit|made a commit|commit(?:ed)? the changes)\b',re.I)),
+]
+def check_claims(text,s):
+    text=text or ''
+    if not text.strip(): return []
+    flags=[]; events=s.get('material_events',[]) or []
+    for name,claim_re in CLAIM_PATTERNS:
+        if not claim_re.search(text): continue
+        if name=='committed':
+            gi=s.get('git_initial',{}) or {}; gc=s.get('git_current',{}) or {}
+            if gi.get('head') and gc.get('head') and gi.get('head')==gc.get('head'):
+                flags.append("Claimed a commit was made, but HEAD is unchanged since session start (no matching `git commit` tool call found).")
+        elif name=='tests_pass':
+            matched=[e for e in events if TEST_CMD_RE.search(e.get('hint','') or '')]
+            if not matched:
+                flags.append("Claimed tests pass, but no test-runner command appears in this session's recorded tool events.")
+            elif any(e.get('ok') is False for e in matched):
+                flags.append("Claimed tests pass, but a matching test-runner tool call in this session recorded a failure.")
+    return flags
+
+SKILL_HINTS=[
+    (re.compile(r'\btest|pytest|jest|go test\b',re.I),'run the project test suite before further changes'),
+    (re.compile(r'\bmerge|pull request|\bpr\b|review\b',re.I),'code-review'),
+    (re.compile(r'\bdeploy|release|ship\b',re.I),'run (verify the change in the running app before calling it done)'),
+    (re.compile(r'\bsecurity|secret|token|credential|vulnerab',re.I),'security-review'),
+    (re.compile(r'\bchart|dashboard|plot|graph|visuali[sz]',re.I),'dataviz'),
+    (re.compile(r'\bhook|settings\.json|permission',re.I),'update-config'),
+]
+def suggest_skills(*texts):
+    blob=' '.join(t for t in texts if t)
+    hits=[sugg for pat,sugg in SKILL_HINTS if pat.search(blob)]
+    return dedupe(hits) or ['(none inferred from objective/next action; choose based on the next action above)']
+
+def handoff_text(s,mode='session',objective=None,next_action=None,note=None,fmt='md'):
+    gc=s.get('git_current',{}); turns=s.get('turns',[]); last=turns[-1] if turns else {}
+    objective=redact_text(objective) or cap(last.get('prompt',''),800) or '(not recorded)'
+    next_action=redact_text(next_action) or '(derive from current plan and latest result)'
+    note=redact_text(note)
+    if fmt=='yaml':
+        return handoff_yaml(s,mode,objective,next_action,note)
+    lines=['# Session Handoff','',f"- Project: {s.get('project','')}",f"- Repository: `{s.get('repo_root','')}`",f"- Harness: {s.get('harness','')}",f"- Session: `{s.get('session_id','')}`",f'- Mode: {mode}',f"- Updated: {s.get('updated_at','')}",f"- Status: {s.get('status','')}",f"- Branch: `{gc.get('branch','')}`",f"- HEAD: `{gc.get('head','')}`",'', '## Objective','',objective.strip(),'','## Last completed result','',cap(last.get('assistant',''),2200).strip() or '(none recorded)','', '## Repository state','']
+    if gc.get('dirty'): lines += ['```text',*gc['dirty'],'```']
+    else: lines.append('Working tree recorded clean.')
+    events=s.get('material_events',[])[-5:]
+    if events:
+        lines += ['','## Recent material tool events','']
+        for e in events:
+            lines.append(f"- {e.get('at','')} {e.get('tool','')}: {e.get('hint','')}")
+    lines += ['','## Next action','',next_action.strip()]
+    if note: lines += ['','## Additional note','',cap(note,1800).strip()]
+    if s.get('last_error'): lines += ['','## Failure/interruption','',cap(s['last_error'],1200)]
+    flags=s.get('claim_flags') or []
+    if flags:
+        lines += ['','## Claim check','']
+        for f in flags: lines.append(f'- {f}')
+    lines += ['','## Suggested skills for next session','']
+    for sk in suggest_skills(objective,next_action,note): lines.append(f'- {sk}')
+    if s.get('transcript_path'): lines += ['','## Full source session','',f"`{s['transcript_path']}`",'','Search this transcript only when the bounded recovery record lacks a required fact; do not load it wholesale.']
+    return '\n'.join(lines).rstrip()+'\n'
+
+def _yline(indent,text): return ('  '*indent)+text
+def _yscalar(v):
+    v='' if v is None else str(v)
+    if v=='' or any(c in v for c in ':#\n') or v.strip()!=v:
+        return json.dumps(v)
+    return v
+def handoff_yaml(s,mode,objective,next_action,note):
+    gc=s.get('git_current',{}); turns=s.get('turns',[]); last=turns[-1] if turns else {}
+    L=[]
+    L.append('# Session Handoff')
+    L.append(f'project: {_yscalar(s.get("project",""))}')
+    L.append(f'repository: {_yscalar(s.get("repo_root",""))}')
+    L.append(f'harness: {_yscalar(s.get("harness",""))}')
+    L.append(f'session: {_yscalar(s.get("session_id",""))}')
+    L.append(f'mode: {_yscalar(mode)}')
+    L.append(f'updated: {_yscalar(s.get("updated_at",""))}')
+    L.append(f'status: {_yscalar(s.get("status",""))}')
+    L.append(f'branch: {_yscalar(gc.get("branch",""))}')
+    L.append(f'head: {_yscalar(gc.get("head",""))}')
+    L.append(f'objective: {_yscalar(objective.strip())}')
+    L.append(f'last_result: {_yscalar(cap(last.get("assistant",""),2200).strip() or "(none recorded)")}')
+    dirty=gc.get('dirty') or []
+    if dirty:
+        L.append('repository_state:')
+        for x in dirty: L.append(_yline(1,f'- {_yscalar(x)}'))
+    else:
+        L.append('repository_state: clean')
+    events=s.get('material_events',[])[-5:]
+    if events:
+        L.append('material_events:')
+        for e in events:
+            L.append(_yline(1,f'- at: {_yscalar(e.get("at",""))}'))
+            L.append(_yline(2,f'tool: {_yscalar(e.get("tool",""))}'))
+            L.append(_yline(2,f'hint: {_yscalar(e.get("hint",""))}'))
+    L.append(f'next_action: {_yscalar(next_action.strip())}')
+    if note: L.append(f'note: {_yscalar(cap(note,1800).strip())}')
+    if s.get('last_error'): L.append(f'failure: {_yscalar(cap(s["last_error"],1200))}')
+    flags=s.get('claim_flags') or []
+    if flags:
+        L.append('claim_check:')
+        for f in flags: L.append(_yline(1,f'- {_yscalar(f)}'))
+    L.append('suggested_skills:')
+    for sk in suggest_skills(objective,next_action,note): L.append(_yline(1,f'- {_yscalar(sk)}'))
+    if s.get('transcript_path'):
+        L.append(f'full_source_session: {_yscalar(s["transcript_path"])}')
+        L.append('note_on_transcript: "Search this transcript only when the bounded recovery record lacks a required fact; do not load it wholesale."')
+    return '\n'.join(L).rstrip()+'\n'
+def archive_session(root,s,p):
+    d=p.parent
+    journal_begin(d,'archive',['state_write','handoff_write','archive_move','archive_trim'])
+    redact_state(s); s['material_score']=material_score(s)
+    atomic_json(p,s); journal_step(d,'state_write')
+    atomic_text(d/'handoff.md',handoff_text(s,fmt=load_manifest(root)['format'])); journal_step(d,'handoff_write')
+    recoverable=bool(s.get('turns') or s.get('pending_prompt') or s.get('material_events') or s.get('last_error') or s.get('handoff_promoted'))
+    if not recoverable:
+        journal_clear(d); shutil.rmtree(d,ignore_errors=True); return None
+    ar=repo_dir(root)/'archive'; ar.mkdir(parents=True,exist_ok=True)
+    dest=ar/f"{epoch()}-{skey(s.get('harness','unknown'),s.get('session_id','unknown'))}"
+    if dest.exists(): shutil.rmtree(dest)
+    shutil.move(str(d),str(dest))
+    journal_step(dest,'archive_move')
+    ds=sorted([x for x in ar.iterdir() if x.is_dir()],key=lambda x:x.stat().st_mtime,reverse=True)
+    for x in ds[ARCHIVE_KEEP:]: shutil.rmtree(x,ignore_errors=True)
+    journal_step(dest,'archive_trim'); journal_clear(dest)
+    return dest
+def archives(root):
+    d=repo_dir(root)/'archive'; out=[]
+    if d.exists():
+        for x in d.iterdir():
+            if x.is_dir():
+                s=read_json(x/'state.json',{}); out.append((x,s)) if s else None
+    return sorted(out,key=lambda z:z[1].get('updated_epoch',0),reverse=True)
+def active(root,h=None):
+    d=repo_dir(root)/'active'; out=[]
+    if d.exists():
+        for x in d.iterdir():
+            if x.is_dir():
+                s=read_json(x/'state.json',{})
+                if s and (not h or s.get('harness')==h): out.append((x,s))
+    return sorted(out,key=lambda z:z[1].get('updated_epoch',0),reverse=True)
+def cleanup_stale_active(root,max_age=86400):
+    for d,s in list(active(root)):
+        if epoch()-int(s.get('updated_epoch',0) or 0)<=max_age: continue
+        p=d/'state.json'
+        if material_score(s)>=2:
+            s['status']='ended:stale-recovery'; save_state(p,s); archive_session(root,s,p)
+        else:
+            shutil.rmtree(d,ignore_errors=True)
+def predecessor(root,h,sid,payload,prior_sid=None):
+    if str(payload.get('source') or '')=='clear':
+        rr,trs=resolve_transition(h)
+        if rr==root and trs:
+            ps=max(trs,key=lambda x:x.get('created_epoch',0)).get('session_id')
+            for d,s in archives(root):
+                if s.get('session_id')==ps: return d,s
+    if prior_sid and prior_sid != sid:
+        for d,s in active(root)+archives(root):
+            if s.get('session_id')==prior_sid: return d,s
+    live=[(d,s) for d,s in active(root) if s.get('session_id')!=sid]
+    recent=[x for x in live if epoch()-int(x[1].get('updated_epoch',0))<=300]
+    if len(recent)==1:
+        return recent[0]
+    for d,s in archives(root):
+        if s.get('session_id')!=sid: return d,s
+    return None,None
+def pointers(root,m):
+    out=[]; hp=Path(m['handoff']); hp=hp if hp.is_absolute() else root/hp; out.append(('Durable handoff',hp))
+    labels={'progress':'Progress/state','knowledge':'Knowledge','private_state':'Private engineering state','legacy_handoffs':'Legacy continuity'}
+    for k,l in labels.items():
+        vals=m.get('pointers',{}).get(k,[]) or []; vals=[vals] if isinstance(vals,str) else vals
+        for v in vals[:4]:
+            p=Path(v); p=p if p.is_absolute() else root/p; out.append((l,p))
+    return out
+def context_card(root,h,payload,prior_sid=None,snap=None,healed=None):
+    m=load_manifest(root); snap=snap or git_snapshot(root); sid=str(payload.get('session_id') or 'unknown'); _,pred=predecessor(root,h,sid,payload,prior_sid)
+    lines=['PROJECT RECOVERY CONTEXT','────────────────────────────────',f"Project: {m['project']}",f'Repository: {root}',f'Current harness: {h}',f"Branch: {snap.get('branch') or '(unknown)'}",f"HEAD: {(snap.get('head') or '')[:12] or '(unknown)'}",f"Working tree entries: {snap.get('dirty_count',0)}"]
+    if healed:
+        lines += ['','Recovered from an interrupted checkpoint write (partial-failure manifest healed on this start):']
+        for d,op,outcome in healed: lines.append(f"- {op}: {outcome}")
+    if pred:
+        lines += ['','Recovery status: EXACT PREDECESSOR RECOVERED','', 'Previous recoverable session',f"- Harness: {pred.get('harness')}",f"- Updated: {pred.get('updated_at')}",f"- Status: {pred.get('status')}",f"- Session: {pred.get('session_id')}"]
+        if pred.get('pending_prompt'):
+            lines += ['','Unfinished request',cap(pred.get('pending_prompt','').replace(chr(10),' '),1000)]
+        if pred.get('turns'):
+            lines += ['','Recent recovery turns']
+            for i,t in enumerate(pred.get('turns',[])[-TURN_KEEP:],1):
+                lines.append(f"{i}. User: {cap(t.get('prompt','').replace(chr(10),' '),700)}")
+                lines.append(f"   Agent: {cap(t.get('assistant','').replace(chr(10),' '),900)}")
+        events=pred.get('material_events',[])[-5:]
+        if events:
+            lines += ['','Recent material tool events']
+            for e in events: lines.append(f"- {e.get('tool','')}: {cap(e.get('hint',''),500)}")
+        if pred.get('last_error'): lines += ['',f"Previous failure/interruption: {cap(pred['last_error'],900)}"]
+        if pred.get('transcript_path'): lines += ['',f"Full previous transcript: {pred['transcript_path']}",'Search it only if bounded recovery lacks a required fact; do not load it wholesale.']
+    else:
+        lines += ['', 'Recovery status: NO EXACT PREDECESSOR RECOVERED', 'Do NOT broadly inspect legacy handovers, session logs, Git history, or the repository merely to reconstruct a missing prior session. Use the explicit project pointers below only if the user task needs them; otherwise report the recovery miss and ask for the intended workstream.']
+    hp=Path(m['handoff']); hp=hp if hp.is_absolute() else root/hp
+    if hp.exists():
+        try:
+            htxt=hp.read_text(encoding='utf-8',errors='replace').strip()
+        except Exception:
+            htxt=''
+        if htxt and 'bootstrap placeholder' not in htxt:
+            lines += ['','Durable handoff excerpt',cap(htxt,1400)]
+    lines += ['','Authoritative pointers']
+    for lab,p in pointers(root,m): lines.append(f"- {lab}: {p} [{'present' if p.exists() else 'missing'}]")
+    others=[s for _,s in active(root) if s.get('session_id')!=sid][:3]
+    if others:
+        lines += ['','Other active sessions (do not assume predecessor without lineage)']
+        for s in others: lines.append(f"- {s.get('harness')} {s.get('session_id')} updated {s.get('updated_at')}")
+    extra=[s for _,s in archives(root) if not pred or s.get('session_id')!=pred.get('session_id')][:4]
+    if extra:
+        lines += ['','Other recent material sessions']
+        for s in extra: lines.append(f"- {s.get('harness')} {s.get('updated_at')} session={s.get('session_id')}")
+        lines.append('Use `agent-context recover --list` for bounded retrieval.')
+    lines += ['','Recovery rule: use these pointers before rediscovering the repository; retrieve deeper history only when the current task needs it.']
+    lines += ['','After evaluating this card, run: agent-context acknowledge --harness '+h+' --status accepted|rejected|needs-clarification']
+    return cap('\n'.join(lines),m['max_context_chars'])
+
+def cmd_hook(a):
+    try: payload=json.load(sys.stdin)
+    except Exception: print('{}'); return 0
+    ev=str(payload.get('hook_event_name') or ''); h=a.harness
+    prior_lr=lineage_record(h) if ev=='SessionStart' else None
+    root=git_root(payload.get('cwd'))
+    if not root and prior_lr: root=Path(prior_lr['repo_root'])
+    if not root and ev=='SessionStart' and str(payload.get('source') or '') in ('clear','resume','startup'):
+        root,_=resolve_transition(h)
+    if not root: print('{}'); return 0
+    lk=lock_repo(root)
+    try:
+        if ev=='SessionStart': cleanup_stale_active(root)
+        healed=heal_stale_journals(root) if ev=='SessionStart' else []
+        s,p=ensure_session(root,payload,h)
+        if ev=='SessionStart':
+            prior_sid=prior_lr.get('session_id') if prior_lr and prior_lr.get('repo_root')==str(root) else None
+            snap=s.get('git_current') or git_snapshot(root)
+            s['source']=payload.get('source'); s['status']='active'; save_state(p,s)
+            card=context_card(root,h,payload,prior_sid=prior_sid,snap=snap,healed=healed)
+            save_lineage(h,root,s.get('session_id'))
+            print(json.dumps({'hookSpecificOutput':{'hookEventName':'SessionStart','additionalContext':card}},separators=(',',':'))); return 0
+        save_lineage(h,root,s.get('session_id'))
+        if ev=='UserPromptSubmit': s['pending_prompt']=cap(payload.get('prompt',''),6000); s['status']='active'; save_state(p,s); print('{}'); return 0
+        if ev=='PostToolUse':
+            tool=str(payload.get('tool_name') or ''); low=tool.lower()
+            if any(k in low for k in ('bash','shell','edit','write','patch')):
+                ti=payload.get('tool_input') if isinstance(payload.get('tool_input'),dict) else {}
+                hint=ti.get('command') or ti.get('file_path') or ti.get('path') or ti.get('patch') or ''
+                evs=list(s.get('material_events',[])); evs.append({'at':now_iso(),'tool':tool,'hint':cap(str(hint).replace(chr(10),' '),700),'ok':infer_ok(payload)}); s['material_events']=evs[-20:]; save_state(p,s)
+            print('{}'); return 0
+        if ev=='Stop':
+            assistant_msg=payload.get('last_assistant_message') or ''
+            flags=check_claims(assistant_msg,s)
+            if flags: s['claim_flags']=dedupe(list(s.get('claim_flags',[]) or [])+flags)
+            turns=list(s.get('turns',[])); turns.append({'at':now_iso(),'prompt':cap(s.get('pending_prompt') or '',6000),'assistant':cap(assistant_msg,7000)}); s['turns']=turns[-TURN_KEEP:]; s['turn_count']=int(s.get('turn_count',0))+1; s['pending_prompt']=None; s['status']='completed_turn'; s['git_current']=git_snapshot(root); save_state(p,s); print('{}'); return 0
+        if ev=='Interrupt': s['status']='interrupted'; s['last_error']='Turn interrupted before normal Stop.'; save_state(p,s); print('{}'); return 0
+        if ev=='StopFailure': s['status']='failed'; s['last_error']=cap(f"{payload.get('error') or 'unknown'}: {payload.get('error_details') or payload.get('last_assistant_message') or ''}",1600); save_state(p,s); print('{}'); return 0
+        if ev=='PreCompact': s['status']='precompact'; save_state(p,s); print('{}'); return 0
+        if ev=='SessionEnd':
+            reason=str(payload.get('reason') or 'other'); s['status']=f'ended:{reason}'; save_state(p,s)
+            if reason=='clear': save_transition(h,root,s.get('session_id'),reason)
+            archive_session(root,s,p); print('{}'); return 0
+        print('{}'); return 0
+    finally: lk.close()
+
+def current_state(root,h=None,sid=None):
+    c=active(root,h); c=[x for x in c if x[1].get('session_id')==sid] if sid else c
+    if not c: return None,None
+    if len(c)>1 and not sid:
+        recent=[x for x in c if epoch()-int(x[1].get('updated_epoch',0))<900]
+        if len(recent)>1: return 'AMBIGUOUS',recent
+    return c[0]
+def cmd_handoff(a):
+    root=git_root(a.repo or os.getcwd())
+    if not root: print('ERROR: not inside a Git repository',file=sys.stderr); return 2
+    sid=a.session_id or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CODEX_THREAD_ID'); d,s=current_state(root,a.harness,sid)
+    if d=='AMBIGUOUS':
+        print('ERROR: multiple recent active sessions; specify --session-id or --harness.',file=sys.stderr)
+        for _,x in s: print(f"- {x.get('harness')} {x.get('session_id')} updated={x.get('updated_at')}",file=sys.stderr)
+        return 3
+    if not s: print('ERROR: no active recovery state found.',file=sys.stderr); return 4
+    d=Path(d)
+    journal_begin(d,'handoff',['session_write','canonical_promote'])
+    s['git_current']=git_snapshot(root); s['status']=f'handoff:{a.mode}'
+    flags=check_claims(a.objective,s)+check_claims(a.next_action,s)+check_claims(a.note,s)
+    if flags: s['claim_flags']=dedupe(list(s.get('claim_flags',[]) or [])+flags)
+    ht=handoff_text(s,a.mode,a.objective,a.next_action,a.note,fmt=load_manifest(root)['format']); atomic_text(d/'handoff.md',ht); journal_step(d,'session_write')
+    other=[x for _,x in active(root) if x.get('session_id')!=s.get('session_id') and epoch()-int(x.get('updated_epoch',0))<900 and material_score(x)>=2]
+    canonical=root/load_manifest(root)['handoff']; promoted=False
+    if other and not a.force_promote:
+        print('Session handoff written, but canonical handoff NOT promoted because another recent material session is active.')
+        for x in other: print(f"- {x.get('harness')} {x.get('session_id')} updated={x.get('updated_at')}")
+    else:
+        atomic_text(canonical,ht); s['handoff_promoted']=True; promoted=True; save_state(d/'state.json',s); journal_step(d,'canonical_promote'); print(f'Canonical handoff promoted: {canonical}')
+    journal_clear(d)
+    print(f"Session handoff: {d/'handoff.md'}\nPromoted: {'yes' if promoted else 'no'}")
+    if flags:
+        print('Claim check flagged:'); [print(f'- {f}') for f in flags]
+    return 0
+def cmd_set_default_format(a):
+    p=state_root()/'config.json'; cfg=read_json(p,{}); cfg['default_format']=a.format
+    atomic_json(p,cfg)
+    print(f'Default handoff/checkpoint format for newly-initialized projects: {a.format}')
+    return 0
+def cmd_acknowledge(a):
+    root=git_root(a.repo or os.getcwd())
+    if not root: print('ERROR: not inside a Git repository',file=sys.stderr); return 2
+    sid=a.session_id or os.environ.get('CLAUDE_SESSION_ID') or os.environ.get('CODEX_THREAD_ID')
+    rec={'at':now_iso(),'harness':a.harness,'session_id':sid,'status':a.status,'note':redact_text(cap(a.note or '',500))}
+    d=repo_dir(root); d.mkdir(parents=True,exist_ok=True)
+    p=d/'acknowledgements.jsonl'
+    with open(p,'a',encoding='utf-8') as f: f.write(json.dumps(rec,sort_keys=True)+'\n')
+    print(f'Acknowledged handoff: status={a.status} session={sid}')
+    return 0
+def _registry_rows():
+    reg=read_json(state_root()/'registry.json',{'repos':{}}); rows=[]
+    for v in reg.get('repos',{}).values():
+        rp=v.get('root'); root=Path(rp) if rp else None
+        if root and root.exists(): rows.append((root,v.get('project') or root.name))
+    return sorted(rows,key=lambda x:str(x[0]))
+def cmd_recover(a):
+    root=git_root(a.repo or os.getcwd())
+    if not root:
+        if a.list:
+            rows=_registry_rows(); print('REGISTERED PROJECT RECOVERY STATE')
+            if not rows: print('(none registered)')
+            for r,name in rows:
+                print(f"{name} | {r} | active={len(active(r))} | archived={len(archives(r))}")
+            print('Use `agent-context recover --repo <path> --list` for one project.')
+            return 0
+        print('No current Git repository. Use `agent-context recover --list` or `agent-context recover --repo <path>`.')
+        return 0
+    aa=active(root); ar=archives(root)
+    if a.list:
+        print('ACTIVE'); [print(f"{s.get('session_id')} | {s.get('harness')} | {s.get('updated_at')} | {s.get('status')}") for _,s in aa[:5]]
+        print('ARCHIVED RECOVERABLE'); [print(f"{s.get('session_id')} | {s.get('harness')} | {s.get('updated_at')} | score={s.get('material_score','?')}") for _,s in ar[:5]]; return 0
+    cand=aa+ar; cand=[x for x in cand if x[1].get('session_id')==a.session] if a.session else cand
+    if not cand: print('No recovery state found.'); return 0
+    print(handoff_text(cand[0][1],fmt=load_manifest(root)['format'])); return 0
+
+def backup(p):
+    if not p.exists(): return None
+    b=p.with_name(p.name+f'.agent-context-backup-{dt.datetime.now().strftime("%Y%m%d-%H%M%S")}'); shutil.copy2(p,b); return b
+def hentry(cmd,timeout=5,matcher=None):
+    g={'hooks':[{'type':'command','command':cmd,'timeout':timeout}]}
+    if matcher is not None: g['matcher']=matcher
+    return g
+def has_cmd(groups,needle): return any(needle in str(h.get('command','')) for g in groups or [] for h in g.get('hooks',[]))
+def merge_hooks(path,h):
+    path.parent.mkdir(parents=True,exist_ok=True); data=read_json(path,{}); data=data if isinstance(data,dict) else {}; hooks=data.setdefault('hooks',{})
+    cmd=f'{Path.home()}/.local/bin/agent-context hook --harness {h}'
+    events=['SessionStart','UserPromptSubmit','PostToolUse','Stop','PreCompact','SessionEnd']+(['Interrupt'] if h=='codex' else ['StopFailure'])
+    for ev in events:
+        groups=hooks.setdefault(ev,[])
+        timeout=3 if h=='codex' and ev in ('SessionEnd','Interrupt') else 5
+        if not has_cmd(groups,'agent-context hook'):
+            groups.append(hentry(cmd,timeout,'*' if ev=='SessionStart' else None))
+        else:
+            for g in groups:
+                for handler in g.get('hooks',[]):
+                    if 'agent-context hook' in str(handler.get('command','')): handler['timeout']=timeout
+    b=backup(path); atomic_json(path,data); return b
+def cmd_install_hooks(a):
+    for h,p in ([('claude',Path.home()/'.claude/settings.json'),('codex',Path.home()/'.codex/hooks.json')] if a.harness=='all' else [(a.harness,Path.home()/('.claude/settings.json' if a.harness=='claude' else '.codex/hooks.json'))]):
+        b=merge_hooks(p,h); print(f'{h}: updated {p}'); print(f'  backup: {b}' if b else '  backup: none (new file)')
+    if a.harness in ('all','codex'): print('Codex: review/trust the new hooks with /hooks before relying on them.')
+    return 0
+def cmd_doctor(a):
+    roots=[]
+    if a.all_projects:
+        reg=read_json(state_root()/'registry.json',{'repos':{}})
+        roots=[Path(v['root']) for v in reg.get('repos',{}).values() if v.get('root') and Path(v['root']).exists()]
+    else:
+        r=git_root(a.repo or os.getcwd()); roots=[r] if r else []
+    if not roots: print('No initialized project found.',file=sys.stderr); return 2
+    bad=0
+    for root in roots:
+        m=load_manifest(root); print(f"PROJECT {m['project']} | {root}")
+        checks=[('Git identity',git_root(root)==root),('Manifest',manifest_file(root).exists()),('AGENTS.md',(root/'AGENTS.md').exists()),('Durable handoff',(root/m['handoff']).exists())]
+        for n,ok in checks: print(f"  {'PASS' if ok else 'FAIL'} {n}"); bad=max(bad,0 if ok else 1)
+        print(f'  INFO active_sessions={len(active(root))} archived_material_sessions={len(archives(root))}')
+        for lab,p in pointers(root,m): print(f"  {'PASS' if p.exists() else 'WARN'} {lab}: {p}")
+        stale=scan_stale_journals(root)
+        print(f"  {'FAIL' if stale else 'PASS'} Partial-failure manifests: {len(stale)} stale journal(s) pending healing")
+        if stale: bad=max(bad,1)
+        print()
+    for h,p in [('Claude',Path.home()/'.claude/settings.json'),('Codex',Path.home()/'.codex/hooks.json')]:
+        if p.exists():
+            d=read_json(p,{}); found=has_cmd(d.get('hooks',{}).get('SessionStart',[]),'agent-context hook') and has_cmd(d.get('hooks',{}).get('Stop',[]),'agent-context hook'); print(f"{'PASS' if found else 'WARN'} {h} global agent-context hook definitions configured (runtime/trust not proven)")
+    return bad
+
+def parser():
+    p=argparse.ArgumentParser(prog='agent-context',description='Provider-neutral project continuity and recovery.'); p.add_argument('--version',action='version',version=f'%(prog)s {VERSION}'); sp=p.add_subparsers(dest='cmd',required=True)
+    x=sp.add_parser('init'); x.add_argument('--repo'); x.add_argument('--project'); x.add_argument('--format',choices=['md','yaml']); x.set_defaults(func=cmd_init)
+    x=sp.add_parser('set-default-format'); x.add_argument('--format',required=True,choices=['md','yaml']); x.set_defaults(func=cmd_set_default_format)
+    x=sp.add_parser('hook'); x.add_argument('--harness',required=True,choices=['claude','codex']); x.set_defaults(func=cmd_hook)
+    x=sp.add_parser('handoff'); x.add_argument('--repo'); x.add_argument('--harness',choices=['claude','codex']); x.add_argument('--session-id'); x.add_argument('--mode',choices=['checkpoint','rotate','final'],default='rotate'); x.add_argument('--objective'); x.add_argument('--next-action'); x.add_argument('--note'); x.add_argument('--force-promote',action='store_true'); x.set_defaults(func=cmd_handoff)
+    x=sp.add_parser('recover'); x.add_argument('--repo'); x.add_argument('--list',action='store_true'); x.add_argument('--session'); x.set_defaults(func=cmd_recover)
+    x=sp.add_parser('install-hooks'); x.add_argument('--harness',choices=['claude','codex','all'],default='all'); x.set_defaults(func=cmd_install_hooks)
+    x=sp.add_parser('doctor'); x.add_argument('--repo'); x.add_argument('--all-projects',action='store_true'); x.set_defaults(func=cmd_doctor)
+    x=sp.add_parser('acknowledge'); x.add_argument('--repo'); x.add_argument('--harness',choices=['claude','codex']); x.add_argument('--session-id'); x.add_argument('--status',required=True,choices=['accepted','rejected','needs-clarification']); x.add_argument('--note'); x.set_defaults(func=cmd_acknowledge)
+    return p
+if __name__=='__main__':
+    a=parser().parse_args()
+    if a.cmd=='hook':
+        try:
+            rc=a.func(a)
+        except Exception:
+            print('{}')
+            rc=0
+        raise SystemExit(0 if rc is None else 0)
+    raise SystemExit(a.func(a))
