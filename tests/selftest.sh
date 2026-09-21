@@ -342,6 +342,176 @@ test -f "$INSTHOME/.claude/skills/handoff/SKILL.md"
 test -f "$INSTHOME/.codex/skills/handoff/SKILL.md"
 jq -e '.default_format=="md"' "$INSTHOME/state/config.json" >/dev/null
 
+# --- doctor runtime-evidence tests (hook_events_seen) ---
+# Runtime evidence is scanned registry-wide (every project Agent-Context knows about),
+# not just the --repo target (see cmd_doctor). Each scenario below therefore gets its
+# own isolated AGENT_CONTEXT_STATE_DIR so an earlier scenario's completed session can't
+# leak in and change a later scenario's expected PASS/INFO verdict.
+
+# Old-format state (no hook_events_seen key) must remain valid: hook stays fail-open,
+# doctor reports "not yet observed" instead of crashing or misreading absence as failure.
+STATE11="$TMP/state-repo11"
+REPO11="$TMP/repo11"
+mkdir -p "$REPO11"
+git -C "$REPO11" init -q
+git -C "$REPO11" config user.email test@example.com
+git -C "$REPO11" config user.name Test
+printf 'o\n' > "$REPO11/o.txt"
+git -C "$REPO11" add o.txt
+git -C "$REPO11" commit -qm init
+AGENT_CONTEXT_STATE_DIR="$STATE11" "$AC" init --repo "$REPO11" --project "doctor-old-state" >/dev/null
+OLD1=old111
+jq -nc --arg cwd "$REPO11" --arg sid "$OLD1" '{hook_event_name:"SessionStart",source:"startup",cwd:$cwd,session_id:$sid}' | AGENT_CONTEXT_STATE_DIR="$STATE11" "$AC" hook --harness claude >/dev/null
+OLD_STATE="$(find "$STATE11/repos" -path '*active*' -name state.json | xargs grep -l "$OLD1" | head -1)"
+python3 - "$OLD_STATE" <<'PY7'
+import json,sys
+from pathlib import Path
+p=Path(sys.argv[1]); d=json.loads(p.read_text()); d.pop('hook_events_seen',None); p.write_text(json.dumps(d))
+PY7
+jq -nc --arg cwd "$REPO11" --arg sid "$OLD1" '{hook_event_name:"UserPromptSubmit",cwd:$cwd,session_id:$sid,prompt:"hi"}' | AGENT_CONTEXT_STATE_DIR="$STATE11" "$AC" hook --harness claude >/dev/null; test $? -eq 0
+jq -nc --arg cwd "$REPO11" --arg sid "$OLD1" '{hook_event_name:"Stop",cwd:$cwd,session_id:$sid,last_assistant_message:"ok"}' | AGENT_CONTEXT_STATE_DIR="$STATE11" "$AC" hook --harness claude >/dev/null; test $? -eq 0
+AGENT_CONTEXT_STATE_DIR="$STATE11" "$AC" doctor --repo "$REPO11" | grep -qE 'INFO latest active evidence, partial lifecycle \(project=doctor-old-state session='"$OLD1"' .*\): UserPromptSubmit, Stop; missing: SessionStart, PostToolUse, SessionEnd \(no closed session with hook_events_seen\)'
+
+# Full normal lifecycle -> runtime PASS with the observed events listed.
+STATE12="$TMP/state-repo12"
+REPO12="$TMP/repo12"
+mkdir -p "$REPO12"
+git -C "$REPO12" init -q
+git -C "$REPO12" config user.email test@example.com
+git -C "$REPO12" config user.name Test
+printf 'p\n' > "$REPO12/p.txt"
+git -C "$REPO12" add p.txt
+git -C "$REPO12" commit -qm init
+AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" init --repo "$REPO12" --project "doctor-full-lifecycle" >/dev/null
+FULL1=full111
+jq -nc --arg cwd "$REPO12" --arg sid "$FULL1" '{hook_event_name:"SessionStart",source:"startup",cwd:$cwd,session_id:$sid}' | AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO12" --arg sid "$FULL1" '{hook_event_name:"UserPromptSubmit",cwd:$cwd,session_id:$sid,prompt:"hi"}' | AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO12" --arg sid "$FULL1" '{hook_event_name:"PostToolUse",cwd:$cwd,session_id:$sid,tool_name:"Read",tool_input:{file_path:"p.txt"}}' | AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO12" --arg sid "$FULL1" '{hook_event_name:"Stop",cwd:$cwd,session_id:$sid,last_assistant_message:"ok"}' | AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO12" --arg sid "$FULL1" '{hook_event_name:"SessionEnd",cwd:$cwd,session_id:$sid,reason:"other"}' | AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" hook --harness claude >/dev/null
+AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" doctor --repo "$REPO12" | grep -qE 'PASS normal lifecycle observed \(project=doctor-full-lifecycle session='"$FULL1"' .*\): SessionStart, UserPromptSubmit, PostToolUse, Stop, SessionEnd'
+
+# A newer, still-live session (only SessionStart so far -- it structurally cannot have
+# emitted SessionEnd yet) must not shadow an earlier *completed* session's evidence:
+# doctor must still select the completed session and print PASS, not regress to partial.
+FULL2=full222
+jq -nc --arg cwd "$REPO12" --arg sid "$FULL2" '{hook_event_name:"SessionStart",source:"startup",cwd:$cwd,session_id:$sid}' | AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" hook --harness claude >/dev/null
+AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" doctor --repo "$REPO12" | grep -qE 'PASS normal lifecycle observed \(project=doctor-full-lifecycle session='"$FULL1"' .*\): SessionStart, UserPromptSubmit, PostToolUse, Stop, SessionEnd'
+
+# Partial lifecycle (no PostToolUse/Stop/SessionEnd yet) -> INFO with observed + missing.
+STATE13="$TMP/state-repo13"
+REPO13="$TMP/repo13"
+mkdir -p "$REPO13"
+git -C "$REPO13" init -q
+git -C "$REPO13" config user.email test@example.com
+git -C "$REPO13" config user.name Test
+printf 'q\n' > "$REPO13/q2.txt"
+git -C "$REPO13" add q2.txt
+git -C "$REPO13" commit -qm init
+AGENT_CONTEXT_STATE_DIR="$STATE13" "$AC" init --repo "$REPO13" --project "doctor-partial-lifecycle" >/dev/null
+PART1=part111
+jq -nc --arg cwd "$REPO13" --arg sid "$PART1" '{hook_event_name:"SessionStart",source:"startup",cwd:$cwd,session_id:$sid}' | AGENT_CONTEXT_STATE_DIR="$STATE13" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO13" --arg sid "$PART1" '{hook_event_name:"UserPromptSubmit",cwd:$cwd,session_id:$sid,prompt:"hi"}' | AGENT_CONTEXT_STATE_DIR="$STATE13" "$AC" hook --harness claude >/dev/null
+AGENT_CONTEXT_STATE_DIR="$STATE13" "$AC" doctor --repo "$REPO13" | grep -qE 'INFO latest active evidence, partial lifecycle \(project=doctor-partial-lifecycle session='"$PART1"' .*\): SessionStart, UserPromptSubmit; missing: PostToolUse, Stop, SessionEnd \(no closed session with hook_events_seen\)'
+
+# Regression: a newer CLOSED-but-partial session must never be masked by an older CLOSED
+# full-lifecycle session's PASS. Both sessions here reach SessionEnd (fully closed), but
+# the older one has the complete normal lifecycle while the newer one is missing events --
+# doctor must report the newer session's partial INFO, not the older PASS.
+STATE16="$TMP/state-repo16"
+REPO16="$TMP/repo16"
+mkdir -p "$REPO16"
+git -C "$REPO16" init -q
+git -C "$REPO16" config user.email test@example.com
+git -C "$REPO16" config user.name Test
+printf 's\n' > "$REPO16/s.txt"
+git -C "$REPO16" add s.txt
+git -C "$REPO16" commit -qm init
+AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" init --repo "$REPO16" --project "doctor-closed-mask" >/dev/null
+OLDFULL=oldfull1
+jq -nc --arg cwd "$REPO16" --arg sid "$OLDFULL" '{hook_event_name:"SessionStart",source:"startup",cwd:$cwd,session_id:$sid}' | AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO16" --arg sid "$OLDFULL" '{hook_event_name:"UserPromptSubmit",cwd:$cwd,session_id:$sid,prompt:"hi"}' | AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO16" --arg sid "$OLDFULL" '{hook_event_name:"PostToolUse",cwd:$cwd,session_id:$sid,tool_name:"Read",tool_input:{file_path:"s.txt"}}' | AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO16" --arg sid "$OLDFULL" '{hook_event_name:"Stop",cwd:$cwd,session_id:$sid,last_assistant_message:"ok"}' | AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO16" --arg sid "$OLDFULL" '{hook_event_name:"SessionEnd",cwd:$cwd,session_id:$sid,reason:"other"}' | AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" hook --harness claude >/dev/null
+# Force the older session's archived state to a clearly older updated_epoch so ordering
+# cannot tie with the newer session created moments later in the same test run.
+OLDFULL_ARCHIVE=$(find "$STATE16" -path '*/archive/*' -name state.json | xargs grep -l "\"$OLDFULL\"")
+python3 -c "
+import json,sys
+p=sys.argv[1]
+d=json.loads(open(p).read())
+d['updated_epoch']=d['updated_epoch']-3600
+open(p,'w').write(json.dumps(d))
+" "$OLDFULL_ARCHIVE"
+NEWPART=newpart1
+jq -nc --arg cwd "$REPO16" --arg sid "$NEWPART" '{hook_event_name:"SessionStart",source:"startup",cwd:$cwd,session_id:$sid}' | AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO16" --arg sid "$NEWPART" '{hook_event_name:"UserPromptSubmit",cwd:$cwd,session_id:$sid,prompt:"hi"}' | AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" hook --harness claude >/dev/null
+jq -nc --arg cwd "$REPO16" --arg sid "$NEWPART" '{hook_event_name:"SessionEnd",cwd:$cwd,session_id:$sid,reason:"other"}' | AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" hook --harness claude >/dev/null
+DOCTOR16_OUT=$(AGENT_CONTEXT_STATE_DIR="$STATE16" "$AC" doctor --repo "$REPO16")
+echo "$DOCTOR16_OUT" | grep -qE 'INFO partial lifecycle observed \(project=doctor-closed-mask session='"$NEWPART"' .*\): SessionStart, UserPromptSubmit, SessionEnd; missing: PostToolUse, Stop'
+! echo "$DOCTOR16_OUT" | grep -q "PASS normal lifecycle observed (project=doctor-closed-mask session=$OLDFULL"
+! echo "$DOCTOR16_OUT" | grep -qE '^  PASS normal lifecycle observed'
+
+# No evidence at all -> INFO "not yet observed", never treated as a doctor failure (exit 0).
+# Runtime evidence is scanned across the whole registry (not just --repo), so this needs
+# its own isolated state dir -- otherwise it would see the completed REPO12 session above.
+NOEV_STATE="$TMP/state-no-evidence"
+REPO14="$TMP/repo14"
+mkdir -p "$REPO14"
+git -C "$REPO14" init -q
+git -C "$REPO14" config user.email test@example.com
+git -C "$REPO14" config user.name Test
+printf 'r2\n' > "$REPO14/r2.txt"
+git -C "$REPO14" add r2.txt
+git -C "$REPO14" commit -qm init
+AGENT_CONTEXT_STATE_DIR="$NOEV_STATE" "$AC" init --repo "$REPO14" --project "doctor-no-evidence" >/dev/null
+AGENT_CONTEXT_STATE_DIR="$NOEV_STATE" "$AC" doctor --repo "$REPO14" > "$TMP/doctor-no-evidence.out"; test $? -eq 0
+grep -q 'INFO runtime not yet observed' "$TMP/doctor-no-evidence.out"
+
+# Registry-wide runtime scope: a session recorded from a DIFFERENT repo must still be
+# visible to doctor run against a repo with no sessions of its own (requirement 3: inspect
+# Agent-Context's own persisted session state, not merely the --repo target). Reuse
+# STATE12, which already holds REPO12's completed session, registered against REPO14.
+AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" init --repo "$REPO14" --project "doctor-no-evidence-registry" >/dev/null
+# Assert the provenance names REPO12's project, not REPO14's own (which has no sessions) --
+# proof the evidence is genuinely coming from elsewhere in the registry.
+AGENT_CONTEXT_STATE_DIR="$STATE12" "$AC" doctor --repo "$REPO14" | grep -qE 'PASS normal lifecycle observed \(project=doctor-full-lifecycle session='"$FULL1"' .*\): SessionStart, UserPromptSubmit, PostToolUse, Stop, SessionEnd'
+
+# Repeated non-material PostToolUse events must not grow hook_events_seen or force
+# repeated state writes: still one entry after several repeats, and no material_events recorded.
+REPO15="$TMP/repo15"
+mkdir -p "$REPO15"
+git -C "$REPO15" init -q
+git -C "$REPO15" config user.email test@example.com
+git -C "$REPO15" config user.name Test
+printf 's\n' > "$REPO15/s.txt"
+git -C "$REPO15" add s.txt
+git -C "$REPO15" commit -qm init
+"$AC" init --repo "$REPO15" --project "doctor-repeat-posttool" >/dev/null
+REP1=rep111
+jq -nc --arg cwd "$REPO15" --arg sid "$REP1" '{hook_event_name:"SessionStart",source:"startup",cwd:$cwd,session_id:$sid}' | "$AC" hook --harness claude >/dev/null
+for i in 1 2 3 4 5; do
+  jq -nc --arg cwd "$REPO15" --arg sid "$REP1" '{hook_event_name:"PostToolUse",cwd:$cwd,session_id:$sid,tool_name:"Read",tool_input:{file_path:"s.txt"}}' | "$AC" hook --harness claude >/dev/null
+done
+REP_STATE="$(find "$AGENT_CONTEXT_STATE_DIR/repos" -path '*active*' -name state.json | xargs grep -l "$REP1" | head -1)"
+python3 - "$REP_STATE" <<'PY8'
+import json,sys
+from pathlib import Path
+d=json.loads(Path(sys.argv[1]).read_text())
+assert list(d.get('hook_events_seen',{}).keys()).count('PostToolUse')==1
+assert d.get('material_events',[])==[]
+PY8
+
+# Existing fail-open behavior remains intact after the hook_events_seen change:
+# malformed stdin and an unwritable state dir still exit 0.
+echo 'not json' | "$AC" hook --harness claude >/dev/null; test $? -eq 0
+UNWRITABLE2="$TMP/unwritable-state-doctor"
+mkdir -p "$UNWRITABLE2"
+chmod 000 "$UNWRITABLE2"
+AGENT_CONTEXT_STATE_DIR="$UNWRITABLE2/deeper" bash -c "cd '$REPO15' && jq -nc --arg cwd '$REPO15' '{hook_event_name:\"SessionStart\",source:\"startup\",cwd:\$cwd,session_id:\"failopen-doctor\"}' | '$AC' hook --harness claude" >/dev/null; test $? -eq 0
+chmod 755 "$UNWRITABLE2"
+
 echo 'PASS: init + exact-root project files'
 echo 'PASS: rolling prompt/Stop checkpoint'
 echo 'PASS: material PostToolUse checkpoint'
@@ -366,4 +536,13 @@ echo 'PASS: interrupted handoff-op journal resumes by rewriting the canonical fi
 echo 'PASS: hook fails open on malformed input and unwritable state dir'
 echo 'PASS: YAML-formatted handoff carries the identical feature set'
 echo 'PASS: install.sh --claude/--codex/--both and --md/--yaml wiring'
+echo 'PASS: old-format state without hook_events_seen remains valid and fail-open'
+echo 'PASS: full normal lifecycle produces doctor runtime PASS with observed events'
+echo 'PASS: partial lifecycle produces doctor runtime INFO with observed + missing events'
+echo 'PASS: no runtime evidence produces INFO not-observed, never a doctor failure'
+echo 'PASS: registry-wide runtime scope surfaces evidence from other repos'
+echo 'PASS: newer live session does not shadow an earlier completed session'\''s PASS evidence'
+echo 'PASS: newer closed partial session is not masked by an older closed full-lifecycle PASS'
+echo 'PASS: repeated non-material PostToolUse does not grow hook_events_seen or record material_events'
+echo 'PASS: fail-open behavior intact after hook_events_seen change'
 echo 'SELFTEST PASS'

@@ -12,6 +12,18 @@ MAX_CONTEXT=8000
 TURN_KEEP=3
 ARCHIVE_KEEP=5
 STATE_ENV='AGENT_CONTEXT_STATE_DIR'
+# Normal-runtime lifecycle events every session is expected to emit. PostToolUse
+# is included even though material_events only records material tool calls;
+# hook_events_seen (see mark_hook_event) records first-observation for every
+# hook_event_name cmd_hook handles, material or not, so a read-only session
+# still proves PostToolUse fired.
+NORMAL_HOOK_EVENTS=['SessionStart','UserPromptSubmit','PostToolUse','Stop','SessionEnd']
+# Conditional events: legitimate to observe, never required for a normal-runtime PASS.
+CONDITIONAL_HOOK_EVENTS=['StopFailure','Interrupt','PreCompact']
+HOOK_EVENTS_BY_HARNESS={
+    'claude':['SessionStart','UserPromptSubmit','PostToolUse','Stop','PreCompact','SessionEnd','StopFailure'],
+    'codex':['SessionStart','UserPromptSubmit','PostToolUse','Stop','PreCompact','SessionEnd','Interrupt'],
+}
 
 CONTINUITY='''<!-- AGENT-CONTEXT-CONTINUITY -->
 ## Agent continuity
@@ -482,12 +494,13 @@ def archive_session(root,s,p):
     for x in ds[ARCHIVE_KEEP:]: shutil.rmtree(x,ignore_errors=True)
     journal_step(dest,'archive_trim'); journal_clear(dest)
     return dest
-def archives(root):
+def archives(root,h=None):
     d=repo_dir(root)/'archive'; out=[]
     if d.exists():
         for x in d.iterdir():
             if x.is_dir():
-                s=read_json(x/'state.json',{}); out.append((x,s)) if s else None
+                s=read_json(x/'state.json',{})
+                if s and (not h or s.get('harness')==h): out.append((x,s))
     return sorted(out,key=lambda z:z[1].get('updated_epoch',0),reverse=True)
 def active(root,h=None):
     d=repo_dir(root)/'active'; out=[]
@@ -576,6 +589,11 @@ def context_card(root,h,payload,prior_sid=None,snap=None,healed=None):
     lines += ['','After evaluating this card, run: agent-context acknowledge --harness '+h+' --status accepted|rejected|needs-clarification']
     return cap('\n'.join(lines),m['max_context_chars'])
 
+def mark_hook_event(s,ev):
+    seen=s.get('hook_events_seen')
+    if not isinstance(seen,dict): seen={}; s['hook_events_seen']=seen
+    if ev in seen: return False
+    seen[ev]=now_iso(); return True
 def cmd_hook(a):
     try: payload=json.load(sys.stdin)
     except Exception: print('{}'); return 0
@@ -594,29 +612,31 @@ def cmd_hook(a):
         if ev=='SessionStart':
             prior_sid=prior_lr.get('session_id') if prior_lr and prior_lr.get('repo_root')==str(root) else None
             snap=s.get('git_current') or git_snapshot(root)
-            s['source']=payload.get('source'); s['status']='active'; save_state(p,s)
+            s['source']=payload.get('source'); s['status']='active'; mark_hook_event(s,ev); save_state(p,s)
             card=context_card(root,h,payload,prior_sid=prior_sid,snap=snap,healed=healed)
             save_lineage(h,root,s.get('session_id'))
             print(json.dumps({'hookSpecificOutput':{'hookEventName':'SessionStart','additionalContext':card}},separators=(',',':'))); return 0
         save_lineage(h,root,s.get('session_id'))
-        if ev=='UserPromptSubmit': s['pending_prompt']=cap(payload.get('prompt',''),6000); s['status']='active'; save_state(p,s); print('{}'); return 0
+        if ev=='UserPromptSubmit': s['pending_prompt']=cap(payload.get('prompt',''),6000); s['status']='active'; mark_hook_event(s,ev); save_state(p,s); print('{}'); return 0
         if ev=='PostToolUse':
             tool=str(payload.get('tool_name') or ''); low=tool.lower()
+            is_new=mark_hook_event(s,ev)
             if any(k in low for k in ('bash','shell','edit','write','patch')):
                 ti=payload.get('tool_input') if isinstance(payload.get('tool_input'),dict) else {}
                 hint=ti.get('command') or ti.get('file_path') or ti.get('path') or ti.get('patch') or ''
                 evs=list(s.get('material_events',[])); evs.append({'at':now_iso(),'tool':tool,'hint':cap(str(hint).replace(chr(10),' '),700),'ok':infer_ok(payload)}); s['material_events']=evs[-20:]; save_state(p,s)
+            elif is_new: save_state(p,s)
             print('{}'); return 0
         if ev=='Stop':
             assistant_msg=payload.get('last_assistant_message') or ''
             flags=check_claims(assistant_msg,s)
             if flags: s['claim_flags']=dedupe(list(s.get('claim_flags',[]) or [])+flags)
-            turns=list(s.get('turns',[])); turns.append({'at':now_iso(),'prompt':cap(s.get('pending_prompt') or '',6000),'assistant':cap(assistant_msg,7000)}); s['turns']=turns[-TURN_KEEP:]; s['turn_count']=int(s.get('turn_count',0))+1; s['pending_prompt']=None; s['status']='completed_turn'; s['git_current']=git_snapshot(root); save_state(p,s); print('{}'); return 0
-        if ev=='Interrupt': s['status']='interrupted'; s['last_error']='Turn interrupted before normal Stop.'; save_state(p,s); print('{}'); return 0
-        if ev=='StopFailure': s['status']='failed'; s['last_error']=cap(f"{payload.get('error') or 'unknown'}: {payload.get('error_details') or payload.get('last_assistant_message') or ''}",1600); save_state(p,s); print('{}'); return 0
-        if ev=='PreCompact': s['status']='precompact'; save_state(p,s); print('{}'); return 0
+            turns=list(s.get('turns',[])); turns.append({'at':now_iso(),'prompt':cap(s.get('pending_prompt') or '',6000),'assistant':cap(assistant_msg,7000)}); s['turns']=turns[-TURN_KEEP:]; s['turn_count']=int(s.get('turn_count',0))+1; s['pending_prompt']=None; s['status']='completed_turn'; s['git_current']=git_snapshot(root); mark_hook_event(s,ev); save_state(p,s); print('{}'); return 0
+        if ev=='Interrupt': s['status']='interrupted'; s['last_error']='Turn interrupted before normal Stop.'; mark_hook_event(s,ev); save_state(p,s); print('{}'); return 0
+        if ev=='StopFailure': s['status']='failed'; s['last_error']=cap(f"{payload.get('error') or 'unknown'}: {payload.get('error_details') or payload.get('last_assistant_message') or ''}",1600); mark_hook_event(s,ev); save_state(p,s); print('{}'); return 0
+        if ev=='PreCompact': s['status']='precompact'; mark_hook_event(s,ev); save_state(p,s); print('{}'); return 0
         if ev=='SessionEnd':
-            reason=str(payload.get('reason') or 'other'); s['status']=f'ended:{reason}'; save_state(p,s)
+            reason=str(payload.get('reason') or 'other'); s['status']=f'ended:{reason}'; mark_hook_event(s,ev); save_state(p,s)
             if reason=='clear': save_transition(h,root,s.get('session_id'),reason)
             archive_session(root,s,p); print('{}'); return 0
         print('{}'); return 0
@@ -743,9 +763,61 @@ def cmd_doctor(a):
         print(f"  {'FAIL' if stale else 'PASS'} Partial-failure manifests: {len(stale)} stale journal(s) pending healing")
         if stale: bad=max(bad,1)
         print()
-    for h,p in [('Claude',Path.home()/'.claude/settings.json'),('Codex',Path.home()/'.codex/hooks.json')]:
+    for h,label,p in [('claude','Claude',Path.home()/'.claude/settings.json'),('codex','Codex',Path.home()/'.codex/hooks.json')]:
+        print(f'{label} configuration')
         if p.exists():
-            d=read_json(p,{}); found=has_cmd(d.get('hooks',{}).get('SessionStart',[]),'agent-context hook') and has_cmd(d.get('hooks',{}).get('Stop',[]),'agent-context hook'); print(f"{'PASS' if found else 'WARN'} {h} global agent-context hook definitions configured (runtime/trust not proven)")
+            d=read_json(p,{}); hooks=d.get('hooks',{})
+            expected=HOOK_EVENTS_BY_HARNESS[h]
+            missing_cfg=[ev for ev in expected if not has_cmd(hooks.get(ev,[]),'agent-context hook')]
+            if not missing_cfg: print(f'  PASS all expected agent-context hook definitions configured ({", ".join(expected)})')
+            else: print(f'  WARN missing agent-context hook definitions: {", ".join(missing_cfg)}')
+        else: print(f'  WARN {p} not found')
+        print(f'{label} runtime')
+        # Runtime evidence is Agent-Context's own persisted state, independent of which
+        # repo doctor was invoked from: scan every registered project, not just `roots`.
+        # Selection policy: prefer the most recent CLOSED session (archived, or an active
+        # one whose status already reached an 'ended:*' terminal state despite not yet
+        # being moved to archive/, e.g. an interrupted archive_session) that carries
+        # hook_events_seen evidence. A currently live/open session must never mask a
+        # newer closed session's partial lifecycle -- an old PASS could otherwise hide a
+        # recent regression where hooks stopped firing. Only when no closed session has
+        # new-format evidence do we fall back to the latest active/open evidence, always
+        # reported as INFO (never PASS), since an open session cannot yet prove SessionEnd.
+        reg=read_json(state_root()/'registry.json',{'repos':{}})
+        reg_roots=[Path(v['root']) for v in reg.get('repos',{}).values() if v.get('root') and Path(v['root']).exists()]
+        for root in roots:
+            if root not in reg_roots: reg_roots.append(root)
+        closed_candidates=[]
+        open_candidates=[]
+        for root in reg_roots:
+            for _,s in archives(root,h):
+                seen=s.get('hook_events_seen')
+                if isinstance(seen,dict) and seen:
+                    closed_candidates.append((int(s.get('updated_epoch',0) or 0),s.get('session_id') or '',seen,root,s.get('session_id'),s.get('updated_at')))
+            for _,s in active(root,h):
+                seen=s.get('hook_events_seen')
+                if not (isinstance(seen,dict) and seen): continue
+                entry=(int(s.get('updated_epoch',0) or 0),s.get('session_id') or '',seen,root,s.get('session_id'),s.get('updated_at'))
+                if str(s.get('status','')).startswith('ended:'): closed_candidates.append(entry)
+                else: open_candidates.append(entry)
+        closed_candidates.sort(key=lambda z:(z[0],z[1]),reverse=True)
+        open_candidates.sort(key=lambda z:(z[0],z[1]),reverse=True)
+        best=closed_candidates[0] if closed_candidates else None
+        is_closed=best is not None
+        if best is None and open_candidates: best=open_candidates[0]
+        if best is None:
+            print('  INFO runtime not yet observed (no session recorded hook_events_seen for this harness)')
+        else:
+            _,_,seen,broot,sid,upd=best
+            proj=load_manifest(broot).get('project',broot.name)
+            src=f'project={proj} session={sid} updated={upd}'
+            observed=[ev for ev in NORMAL_HOOK_EVENTS if ev in seen]
+            missing=[ev for ev in NORMAL_HOOK_EVENTS if ev not in seen]
+            if not missing and is_closed: print(f'  PASS normal lifecycle observed ({src}): {", ".join(observed)}')
+            elif not missing and not is_closed: print(f'  INFO latest active evidence, full lifecycle so far ({src}): {", ".join(observed)} (no closed session with hook_events_seen)')
+            elif is_closed: print(f'  INFO partial lifecycle observed ({src}): {", ".join(observed) or "(none)"}; missing: {", ".join(missing)}')
+            else: print(f'  INFO latest active evidence, partial lifecycle ({src}): {", ".join(observed) or "(none)"}; missing: {", ".join(missing)} (no closed session with hook_events_seen)')
+        print()
     return bad
 
 def parser():
