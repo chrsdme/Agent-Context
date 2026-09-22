@@ -512,6 +512,57 @@ chmod 000 "$UNWRITABLE2"
 AGENT_CONTEXT_STATE_DIR="$UNWRITABLE2/deeper" bash -c "cd '$REPO15' && jq -nc --arg cwd '$REPO15' '{hook_event_name:\"SessionStart\",source:\"startup\",cwd:\$cwd,session_id:\"failopen-doctor\"}' | '$AC' hook --harness claude" >/dev/null; test $? -eq 0
 chmod 755 "$UNWRITABLE2"
 
+# Regression: managed IDENTITY block states the read-only exemption and the
+# write/mismatch-triggered verification rule.
+grep -q 'AGENT-CONTEXT-PROJECT-IDENTITY-GUARD' "$REPO/AGENTS.md"
+python3 - "$REPO/AGENTS.md" <<'PY9'
+import re,sys
+from pathlib import Path
+text=Path(sys.argv[1]).read_text()
+m=re.search(r'<!-- AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->(.*?)<!-- /AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->', text, re.S)
+assert m, 'managed IDENTITY block not found'
+block=m.group(1)
+assert 'do not run' in block and 'solely to' in block and 'reconfirm repository identity' in block, 'read-only exemption missing'
+assert 'concrete evidence' in block and 'mismatch' in block, 'mismatch-triggered verification missing'
+assert 'stop before writes' in block, 'fail-closed write behavior missing'
+PY9
+
+# Regression: `agent-context init` re-run on an existing AGENTS.md with an
+# old/stale managed IDENTITY block replaces it with the current template.
+REPO16="$TMP/repo16"
+mkdir -p "$REPO16"
+git -C "$REPO16" init -q
+git -C "$REPO16" config user.email test@example.com
+git -C "$REPO16" config user.name Test
+printf 'seed\n' > "$REPO16/seed.txt"
+git -C "$REPO16" add seed.txt
+git -C "$REPO16" commit -qm init
+cat > "$REPO16/AGENTS.md" <<AGENTSOLD
+# Existing notes
+
+<!-- AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->
+## Repository Identity Guard
+
+Expected repository root:
+
+\`$REPO16\`
+
+Before modifying project files, verify the current Git top-level.
+<!-- /AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->
+AGENTSOLD
+"$AC" init --repo "$REPO16" --project reinit-identity >/dev/null
+grep -q '# Existing notes' "$REPO16/AGENTS.md"
+python3 - "$REPO16/AGENTS.md" <<'PY10'
+import re,sys
+from pathlib import Path
+text=Path(sys.argv[1]).read_text()
+assert text.count('AGENT-CONTEXT-PROJECT-IDENTITY-GUARD') == 2, 'managed block must appear exactly once (start+end markers)'
+m=re.search(r'<!-- AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->(.*?)<!-- /AGENT-CONTEXT-PROJECT-IDENTITY-GUARD -->', text, re.S)
+assert m, 'managed IDENTITY block not found after re-init'
+block=m.group(1)
+assert 'do not run' in block and 'reconfirm repository identity' in block, 'old block was not replaced with the updated template'
+PY10
+
 echo 'PASS: init + exact-root project files'
 echo 'PASS: rolling prompt/Stop checkpoint'
 echo 'PASS: material PostToolUse checkpoint'
@@ -545,4 +596,6 @@ echo 'PASS: newer live session does not shadow an earlier completed session'\''s
 echo 'PASS: newer closed partial session is not masked by an older closed full-lifecycle PASS'
 echo 'PASS: repeated non-material PostToolUse does not grow hook_events_seen or record material_events'
 echo 'PASS: fail-open behavior intact after hook_events_seen change'
+echo 'PASS: managed IDENTITY block states read-only exemption and fail-closed write/mismatch behavior'
+echo 'PASS: agent-context init replaces a stale managed IDENTITY block on re-init'
 echo 'SELFTEST PASS'

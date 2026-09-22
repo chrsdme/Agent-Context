@@ -45,7 +45,12 @@ Expected repository root:
 
 `{root}`
 
-Before modifying project files, verify the current Git top-level. If it does not exactly match the path above:
+For read-only work, do not run `pwd`/`git`/other shell commands solely to
+reconfirm repository identity; proceed directly.
+
+Verify the current Git top-level before modifying project files, or as soon
+as there is concrete evidence of a repository mismatch. If it does not
+exactly match the path above:
 
 - stop before writes;
 - do not compensate with absolute paths into another known repository;
